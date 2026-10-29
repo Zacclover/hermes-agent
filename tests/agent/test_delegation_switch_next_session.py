@@ -45,12 +45,12 @@ def options_backend(monkeypatch):
     srv.__exit__(None, None, None)
 
 
-def _agent(srv, home, session_id):
+def _agent(srv, home, session_id, *, source="cli"):
     from hermes_state import SessionDB
     from run_agent import AIAgent
 
     db = SessionDB(db_path=home / "state.db")
-    db.ensure_session(session_id, source="cli")  # opened before its first turn, as the gateway does
+    db.ensure_session(session_id, source=source)  # opened before its first turn, as the gateway does
     return AIAgent(provider="custom", base_url=srv.base_url, api_key="sk-fake-e2e", model="fake-model",
                    session_db=db, session_id=session_id, quiet_mode=True, platform="cli")
 
@@ -122,3 +122,30 @@ def test_a_plain_switch_changes_nothing_in_this_session_and_new_sessions_take_th
     _turn(new, "hello again", [])
     assert "option" not in _sent_task_fields(srv) and _routed_on(new) == "default"
     new.close()
+
+
+def test_slack_rollout_rebuilds_an_existing_session_on_its_next_user_turn(options_backend):
+    import hermes_yaml as yaml
+    from agent.delegation_backends import set_global_backend
+
+    srv, home = options_backend
+    set_global_backend("default")
+    old = _agent(srv, home, "slack-rollout", source="slack")
+    history = _turn(old, "before the rollout", [])
+    assert "option" not in _sent_task_fields(srv) and _routed_on(old) == "default"
+    old.close()
+
+    config_path = home / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["delegation"]["backend"] = "probe-options"
+    config["delegation"]["session_tool_rollout"] = {"id": "slack-routes-v1", "sources": ["slack"]}
+    config_path.write_text(yaml.safe_dump(config))
+    set_global_backend("probe-options")
+
+    resumed = _agent(srv, home, "slack-rollout", source="slack")
+    _turn(resumed, "after the rollout", history)
+    assert "option" in _sent_task_fields(srv) and _routed_on(resumed) == "probe-options"
+    assert resumed._session_db.get_session_model_config_value(
+        "slack-rollout", "_delegation_toolset_rollout"
+    ) == "slack-routes-v1"
+    resumed.close()

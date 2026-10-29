@@ -110,22 +110,61 @@ def _current_session_key(agent: Any) -> str:
     return get_session_env("HERMES_SESSION_KEY", "") or str(getattr(agent, "session_id", "") or "")
 
 
+_ROLLOUT_KEY = "_delegation_toolset_rollout"
+
+
+def _configured_session_rollout(agent: Any) -> str:
+    """Return the unconsumed, source-scoped tool rollout id for this session."""
+    from tools.delegate_tool_config import _load_config
+
+    rollout = _load_config().get("session_tool_rollout")
+    if not isinstance(rollout, dict):
+        return ""
+    rollout_id, sources = rollout.get("id"), rollout.get("sources")
+    if not isinstance(rollout_id, str) or not rollout_id or not isinstance(sources, list):
+        return ""
+    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", "")
+    if not db or not session_id:
+        return ""
+    session = db.get_session(session_id) or {}
+    if session.get("source") not in sources:
+        return ""
+    return "" if db.get_session_model_config_value(session_id, _ROLLOUT_KEY) == rollout_id else rollout_id
+
+
+def _persist_rebuilt_tools(agent: Any) -> None:
+    """Persist the rebuilt pin strictly before acknowledging a durable rollout."""
+    from tools.mcp_tool_agent import _agent_tool_defs, tool_pin_version
+
+    pin = {"version": tool_pin_version(), "tools": _agent_tool_defs(agent)}
+    backend = getattr(agent, "_delegation_backend", None)
+    if isinstance(backend, str) and backend:
+        pin["delegation_backend"] = backend
+    agent._session_db.update_session_tool_names(agent.session_id, pin)
+
+
 def apply_requested_tool_rebuild(agent: Any) -> bool:
-    """Turn start, after the session's tools are restored: rebuild ``agent.tools`` (and with it the backend the
-    session routes on) if ``set_global_backend(apply_now=True)`` asked for this session, and pin both to the
-    session row so a later fresh agent restores them. True when the tool list changed. Forks (background review, ``/btw``) and
-    subagents share the session's key but never take its request."""
+    """Apply a one-session switch or a source-scoped rollout after a pinned-tool restore.
+
+    A rollout remains pending if either its schema pin or its acknowledgement cannot be persisted.
+    """
     if getattr(agent, "_turn_origin", None) or getattr(agent, "_delegate_depth", 0):
         return False
     key = _current_session_key(agent)
+    rollout_id = _configured_session_rollout(agent)
     with _lock:
-        if key not in _rebuild_requests:
-            return False
-        _rebuild_requests.discard(key)
+        requested_now = key in _rebuild_requests
+        if requested_now:
+            _rebuild_requests.discard(key)
+    if not requested_now and not rollout_id:
+        return False
     from hermes_cli.observability.shared_metrics_efficiency import record_cache_break
     from tools.mcp_tool_agent import refresh_agent_mcp_tools
     before = getattr(agent, "tools", None)
-    refresh_agent_mcp_tools(agent, quiet_mode=True, content_aware=True)  # adopts the saved backend, re-pins a change
+    refresh_agent_mcp_tools(agent, quiet_mode=True, content_aware=True)
+    if rollout_id:
+        _persist_rebuilt_tools(agent)
+        agent._session_db.patch_session_model_config(agent.session_id, {_ROLLOUT_KEY: rollout_id})
     if agent.tools is before:
         return False
     record_cache_break(agent, "toolset_change")
